@@ -1,25 +1,45 @@
 #!/usr/bin/env bash
-# ollama-rdna1: drop-in replacement for ollama using llama.cpp + Vulkan
+# ollama-rdna1: drop-in replacement for ollama using llama.cpp
+# (Vulkan on Linux/RDNA1; Metal when built that way on macOS)
 # Provides: serve, run, list, pull, stop, ps
 
 set -euo pipefail
 
-SHIM_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    export GGML_METAL_CONCURRENCY_DISABLE=1
+fi
+
+resolve_path() {
+    readlink -f "$1" 2>/dev/null \
+        || python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"
+}
+
+SHIM_DIR="$(cd "$(dirname "$(resolve_path "${BASH_SOURCE[0]}")")" && pwd)"
 LLAMA_DIR="$SHIM_DIR/llama.cpp"
 LLAMA_SERVER="$LLAMA_DIR/build/bin/llama-server"
 LLAMA_CLI="$LLAMA_DIR/build/bin/llama-cli"
 LLAMA_MTMD_CLI="$LLAMA_DIR/build/bin/llama-mtmd-cli"
 OLLAMA_PROXY="$SHIM_DIR/ollama_proxy.py"
 MODELS_DIR="$SHIM_DIR/models"
-PORT=11434
-BACKEND_PORT=8081
-GPU_LAYERS=99
-PID_FILE="/tmp/ollama-rdna1.pid"
-PROXY_PID_FILE="/tmp/ollama-rdna1-proxy.pid"
-LOG_FILE="/tmp/ollama-rdna1.log"
+
+# --- settings (all overridable from the environment) ---
+PORT="${OLLAMA_RDNA1_PORT:-11435}"
+BACKEND_PORT="${OLLAMA_RDNA1_BACKEND_PORT:-8081}"
+GPU_LAYERS="${GPU_LAYERS:-99}"
+CTX_SIZE="${CTX_SIZE:-4096}"
+CACHE_PROMPT="${CACHE_PROMPT:-0}"      # 1 = let llama-server reuse the prompt cache
+BACKEND_WAIT="${BACKEND_WAIT:-120}"    # seconds to wait for llama-server to load the model
+
+# Per-user state dir (PID files and log); /tmp is world-writable.
+STATE_DIR="${OLLAMA_RDNA1_STATE_DIR:-/tmp/ollama-rdna1-$(id -u)}"
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+PID_FILE="$STATE_DIR/ollama-rdna1.pid"
+PROXY_PID_FILE="$STATE_DIR/ollama-rdna1-proxy.pid"
+LOG_FILE="$STATE_DIR/ollama-rdna1.log"
 
 # --- model registry ---
-OLLAMA_REGISTRY="https://registry.ollama.ai"
+OLLAMA_REGISTRY="${OLLAMA_REGISTRY:-https://registry.ollama.ai}"
 
 # Local cache of pulled models: maps "name:tag" -> gguf filename
 MANIFEST_DIR="$MODELS_DIR/.manifests"
@@ -29,6 +49,94 @@ MANIFEST_DIR="$MODELS_DIR/.manifests"
 red()    { echo -e "\033[31m$*\033[0m"; }
 green()  { echo -e "\033[32m$*\033[0m"; }
 yellow() { echo -e "\033[33m$*\033[0m"; }
+
+# json_field <file> <key>: print one top-level field of a JSON file.
+# Values are passed as argv, never interpolated into Python source.
+json_field() {
+    python3 - "$1" "$2" <<'PY' 2>/dev/null
+import json, sys
+print(json.load(open(sys.argv[1]))[sys.argv[2]])
+PY
+}
+
+# write_manifest <file> <model_ref> <gguf_file> <digest> <size> <source> [key=value ...]
+write_manifest() {
+    python3 - "$@" <<'PY'
+import json, sys
+path, model_ref, gguf_file, digest, size, source = sys.argv[1:7]
+info = {"model_ref": model_ref, "gguf_file": gguf_file, "digest": digest,
+        "size": int(size or 0), "source": source}
+for kv in sys.argv[7:]:
+    key, _, value = kv.partition("=")
+    info[key] = value
+with open(path, "w") as f:
+    json.dump(info, f, indent=2)
+PY
+}
+
+# manifest_model_layer: read an Ollama registry manifest on stdin, print "<digest> <size>"
+manifest_model_layer() {
+    python3 -c '
+import json, sys
+m = json.load(sys.stdin)
+for layer in m["layers"]:
+    if layer["mediaType"] == "application/vnd.ollama.image.model":
+        print(layer["digest"], layer["size"])
+        break
+'
+}
+
+file_size() {
+    stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || echo 0
+}
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        return 1
+    fi
+}
+
+# download_file <url> <dest> [expected_size] [expected_sha256]
+# Downloads to <dest>.part (resumable), verifies, then renames, so an
+# interrupted download can never be mistaken for a finished model.
+download_file() {
+    local url="$1" dest="$2" want_size="${3:-}" want_sha="${4:-}"
+    local part="$dest.part"
+
+    if ! curl -fL --progress-bar -C - -o "$part" "$url"; then
+        red "Download failed (partial data kept for resume: $part)"
+        return 1
+    fi
+
+    if [[ -n "$want_size" ]]; then
+        local got
+        got=$(file_size "$part")
+        if [[ "$got" -ne "$want_size" ]]; then
+            red "Size mismatch! Expected $want_size, got $got"
+            rm -f "$part"
+            return 1
+        fi
+    fi
+
+    if [[ -n "$want_sha" ]]; then
+        local got_sha
+        if got_sha=$(sha256_of "$part"); then
+            if [[ "$got_sha" != "$want_sha" ]]; then
+                red "SHA-256 mismatch! Expected $want_sha, got $got_sha"
+                rm -f "$part"
+                return 1
+            fi
+        else
+            yellow "No sha256sum/shasum found; skipping checksum verification"
+        fi
+    fi
+
+    mv -f "$part" "$dest"
+}
 
 parse_model_ref() {
     # Parse "qwen2.5" or "qwen2.5:7b" or "library/qwen2.5:7b"
@@ -54,7 +162,7 @@ model_gguf_name() {
     local ref="$1"
     local manifest_file="$MANIFEST_DIR/${ref//[:\/]/_}.json"
     if [[ -f "$manifest_file" ]]; then
-        python3 -c "import json; print(json.load(open('$manifest_file'))['gguf_file'])" 2>/dev/null
+        json_field "$manifest_file" gguf_file
         return
     fi
     return 1
@@ -76,8 +184,8 @@ resolve_model() {
         for mf in "$MANIFEST_DIR"/*.json; do
             [[ -f "$mf" ]] || continue
             local mref mfile
-            mref=$(python3 -c "import json; print(json.load(open('$mf'))['model_ref'])" 2>/dev/null)
-            mfile=$(python3 -c "import json; print(json.load(open('$mf'))['gguf_file'])" 2>/dev/null)
+            mref=$(json_field "$mf" model_ref) || continue
+            mfile=$(json_field "$mf" gguf_file) || continue
             if [[ "$mref" == *"$name"* && -f "$MODELS_DIR/$mfile" ]]; then
                 echo "$mfile"
                 return
@@ -86,7 +194,19 @@ resolve_model() {
     fi
     # fallback: first .gguf in models dir matching name
     for f in "$MODELS_DIR"/*"$name"*.gguf; do
-        [[ -f "$f" ]] && echo "$(basename "$f")" && return
+        [[ -f "$f" ]] && basename "$f" && return
+    done
+    return 1
+}
+
+# first_model_file: first usable model in MODELS_DIR (mmproj files are not models)
+first_model_file() {
+    local f
+    for f in "$MODELS_DIR"/*.gguf; do
+        [[ -f "$f" ]] || continue
+        [[ "$(basename "$f")" == mmproj-* ]] && continue
+        basename "$f"
+        return 0
     done
     return 1
 }
@@ -101,7 +221,7 @@ find_mmproj() {
     # try: mmproj-<identity>*.gguf, then mmproj-<base>*.gguf
     for pattern in "mmproj-${identity}"*.gguf "mmproj-${base}"*.gguf "${base}"*mmproj*.gguf; do
         for f in "$MODELS_DIR"/$pattern; do
-            [[ -f "$f" ]] && echo "$(basename "$f")" && return 0
+            [[ -f "$f" ]] && basename "$f" && return 0
         done
     done
     return 1
@@ -115,31 +235,87 @@ get_running_pid() {
     return 1
 }
 
+port_listening() {
+    command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+# find_project_proxy_pid: PID of a listener on $PORT that is this project's proxy
+find_project_proxy_pid() {
+    command -v lsof >/dev/null 2>&1 || return 1
+    local candidate cmd
+    for candidate in $(lsof -nP -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true); do
+        cmd=$(ps -ww -p "$candidate" -o command= 2>/dev/null || true)
+        if [[ "$cmd" == *"$OLLAMA_PROXY"* && "$cmd" == *"$PORT $BACKEND_PORT"* ]]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# wait_for_exit <pid> [timeout_s]: 0 once the process is gone, 1 on timeout
+wait_for_exit() {
+    local pid="$1" timeout="${2:-10}" i=0
+    while kill -0 "$pid" 2>/dev/null; do
+        if (( i >= timeout * 5 )); then
+            return 1
+        fi
+        sleep 0.2
+        i=$((i + 1))
+    done
+    return 0
+}
+
+# stop_pid <pid> [grace_s]: SIGTERM, wait, SIGKILL as a last resort
+stop_pid() {
+    local pid="$1" grace="${2:-10}"
+    kill "$pid" 2>/dev/null || true
+    if ! wait_for_exit "$pid" "$grace"; then
+        yellow "PID $pid ignored SIGTERM for ${grace}s; sending SIGKILL"
+        kill -9 "$pid" 2>/dev/null || true
+        wait_for_exit "$pid" 3 || true
+    fi
+}
+
+# start_proxy: launch the proxy, wait until it answers, record its PID
+start_proxy() {
+    if port_listening "$PORT"; then
+        red "Port $PORT is occupied by another process; refusing to start a duplicate proxy."
+        return 1
+    fi
+
+    python3 "$OLLAMA_PROXY" "$PORT" "$BACKEND_PORT" >> "$LOG_FILE" 2>&1 &
+    local proxy_pid=$!
+    local i
+    for i in {1..10}; do
+        if ! kill -0 "$proxy_pid" 2>/dev/null; then
+            break
+        fi
+        if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+            echo "$proxy_pid" > "$PROXY_PID_FILE"
+            return 0
+        fi
+        sleep 1
+    done
+
+    kill "$proxy_pid" 2>/dev/null || true
+    return 1
+}
+
 # --- commands ---
 
 cmd_serve() {
     local model_name="${1:-}"
     local model_file=""
+    local pid=""
 
     if [[ -n "$model_name" ]]; then
         model_file=$(resolve_model "$model_name") || { red "Unknown model: $model_name"; cmd_list; exit 1; }
     else
-        # find first available model
-        for key in "${!MODEL_FILES[@]}"; do
-            if [[ -f "$MODELS_DIR/${MODEL_FILES[$key]}" ]]; then
-                model_file="${MODEL_FILES[$key]}"
-                model_name="$key"
-                break
-            fi
-        done
-        # fallback: any .gguf in models dir
+        model_file=$(first_model_file) || true
         if [[ -z "$model_file" ]]; then
-            model_file=$(ls "$MODELS_DIR"/*.gguf 2>/dev/null | head -1)
-            if [[ -z "$model_file" ]]; then
-                red "No models found. Run: ollama-rdna1 pull qwen2.5:1.5b"
-                exit 1
-            fi
-            model_file=$(basename "$model_file")
+            red "No models found. Run: ollama-rdna1 pull qwen2.5:1.5b"
+            exit 1
         fi
     fi
 
@@ -152,8 +328,22 @@ cmd_serve() {
 
     if pid=$(get_running_pid); then
         local current_model
-        current_model=$(ps -p "$pid" -o args= 2>/dev/null | grep -oP '(?<=-m )\S+' | xargs basename 2>/dev/null || echo "")
+        current_model=$(ps -ww -p "$pid" -o args= 2>/dev/null | awk '{for (i=1;i<NF;i++) if ($i=="-m") {n=split($(i+1),a,"/"); print a[n]; exit}}' || echo "")
         if [[ "$current_model" == "$model_file" ]]; then
+            # Backend already serves this model; make sure the proxy is up.
+            if ! curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+                if port_listening "$PORT"; then
+                    red "Proxy port $PORT is occupied but unhealthy; leaving processes untouched."
+                    exit 1
+                fi
+                start_proxy || { red "Proxy recovery failed; backend remains running."; exit 1; }
+            fi
+
+            local known_proxy
+            if known_proxy=$(find_project_proxy_pid); then
+                echo "$known_proxy" > "$PROXY_PID_FILE"
+            fi
+
             green "Already serving $model_file (PID $pid)"
             exit 0
         fi
@@ -161,12 +351,17 @@ cmd_serve() {
         cmd_stop
     fi
 
+    if port_listening "$BACKEND_PORT"; then
+        red "Backend port $BACKEND_PORT is already in use by another process; aborting."
+        exit 1
+    fi
+
     local mmproj_file
     mmproj_file=$(find_mmproj "$model_file") || true
 
     green "Starting ollama-rdna1 on port $PORT with $model_file"
     [[ -n "$mmproj_file" ]] && echo "Multimodal projector: $mmproj_file"
-    echo "GPU layers: $GPU_LAYERS | Vulkan backend"
+    echo "GPU layers: $GPU_LAYERS | ctx: $CTX_SIZE | prompt cache: $([[ "$CACHE_PROMPT" == "1" ]] && echo on || echo off)"
     echo "Ollama API: http://127.0.0.1:$PORT"
     echo "llama.cpp backend: http://127.0.0.1:$BACKEND_PORT"
     echo ""
@@ -183,32 +378,66 @@ cmd_serve() {
         -m "$model_path"
         --port "$BACKEND_PORT"
         --gpu-layers "$GPU_LAYERS"
-        --ctx-size 4096
+        --ctx-size "$CTX_SIZE"
+        --flash-attn off
+        --no-cache-idle-slots
         --host 127.0.0.1
     )
+    if [[ "$CACHE_PROMPT" != "1" ]]; then
+        server_args+=(--no-cache-prompt)
+    fi
     if [[ -n "$mmproj_file" ]]; then
         server_args+=(--mmproj "$MODELS_DIR/$mmproj_file" --jinja)
     fi
 
     "$LLAMA_SERVER" "${server_args[@]}" >> "$LOG_FILE" 2>&1 &
-    echo $! > "$PID_FILE"
+    local backend_pid=$!
+    echo "$backend_pid" > "$PID_FILE"
 
-    # wait for backend to be ready
+    # wait for backend to be ready, and notice if it dies while loading
     echo -n "Waiting for backend..."
-    for i in {1..30}; do
+    local ready=0 i
+    for ((i = 0; i < BACKEND_WAIT; i++)); do
+        if ! kill -0 "$backend_pid" 2>/dev/null; then
+            break
+        fi
         if curl -sf "http://127.0.0.1:$BACKEND_PORT/health" > /dev/null 2>&1; then
-            echo " ready"
+            ready=1
             break
         fi
         echo -n "."
         sleep 1
     done
+    echo ""
 
-    # start Ollama API proxy on public port
-    python3 "$OLLAMA_PROXY" "$PORT" "$BACKEND_PORT" >> "$LOG_FILE" 2>&1 &
-    echo $! > "$PROXY_PID_FILE"
+    if [[ "$ready" -ne 1 ]]; then
+        if kill -0 "$backend_pid" 2>/dev/null; then
+            red "Backend not ready after ${BACKEND_WAIT}s (raise BACKEND_WAIT for big models); stopping it."
+            stop_pid "$backend_pid" 10
+        else
+            red "Backend exited during startup."
+        fi
+        rm -f "$PID_FILE"
+        red "Last log lines ($LOG_FILE):"
+        tail -n 20 "$LOG_FILE" || true
+        exit 1
+    fi
+    green "Backend ready"
 
-    green "Server started. Backend PID $(cat "$PID_FILE"), Proxy PID $(cat "$PROXY_PID_FILE")"
+    # Reuse an existing proxy only if it belongs to this project.
+    local proxy_pid=""
+    if proxy_pid=$(find_project_proxy_pid); then
+        echo "$proxy_pid" > "$PROXY_PID_FILE"
+        green "Reusing existing proxy PID $proxy_pid"
+    else
+        if ! start_proxy; then
+            red "Proxy did not become ready; PID was not registered."
+            red "Backend PID $backend_pid remains running."
+            return 1
+        fi
+    fi
+
+    green "Server started. Backend PID $backend_pid, Proxy PID $(cat "$PROXY_PID_FILE")"
     green "Logs: $LOG_FILE"
 }
 
@@ -238,15 +467,14 @@ cmd_run() {
             -m "$model_path" \
             --mmproj "$MODELS_DIR/$mmproj_file" \
             --gpu-layers "$GPU_LAYERS" \
-            --ctx-size 4096 \
+            --ctx-size "$CTX_SIZE" \
             --jinja
     else
         green "Running $model_file (interactive chat, Ctrl+C to exit)"
         "$LLAMA_CLI" \
             -m "$model_path" \
             --gpu-layers "$GPU_LAYERS" \
-            --ctx-size 4096 \
-            --conversation
+            --ctx-size "$CTX_SIZE"
     fi
 }
 
@@ -262,8 +490,8 @@ cmd_list() {
         for mf in "$MANIFEST_DIR"/*.json; do
             [[ -f "$mf" ]] || continue
             local mref mfile
-            mref=$(python3 -c "import json; print(json.load(open('$mf'))['model_ref'])" 2>/dev/null) || continue
-            mfile=$(python3 -c "import json; print(json.load(open('$mf'))['gguf_file'])" 2>/dev/null) || continue
+            mref=$(json_field "$mf" model_ref) || continue
+            mfile=$(json_field "$mf" gguf_file) || continue
             if [[ -f "$MODELS_DIR/$mfile" ]]; then
                 local size mmtag=""
                 size=$(du -h "$MODELS_DIR/$mfile" | cut -f1)
@@ -285,12 +513,12 @@ cmd_list() {
             for mf in "$MANIFEST_DIR"/*.json; do
                 [[ -f "$mf" ]] || continue
                 local mfile
-                mfile=$(python3 -c "import json; print(json.load(open('$mf'))['gguf_file'])" 2>/dev/null) || continue
+                mfile=$(json_field "$mf" gguf_file) || continue
                 [[ "$mfile" == "$base" ]] && tracked=1 && break
             done
         fi
         if [[ $tracked -eq 0 ]]; then
-            # skip mmproj files — they're accessories, not standalone models
+            # skip mmproj files: they're accessories, not standalone models
             [[ "$base" == mmproj-* ]] && continue
             local size mmtag=""
             size=$(du -h "$f" | cut -f1)
@@ -330,6 +558,10 @@ cmd_pull() {
             hf_repo="$hf_ref"
             hf_quant="Q4_K_M"
         fi
+        if [[ ! "$hf_repo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ || ! "$hf_quant" =~ ^[A-Za-z0-9_]+$ ]]; then
+            red "Invalid HuggingFace reference: $model_name"
+            exit 1
+        fi
         local repo_name="${hf_repo##*/}"
         local base_name="${repo_name%-GGUF}"
 
@@ -342,7 +574,7 @@ cmd_pull() {
             green "Model already exists: $model_filename ($(du -h "$MODELS_DIR/$model_filename" | cut -f1))"
         else
             echo "Downloading $model_filename..."
-            curl -L --progress-bar -o "$MODELS_DIR/$model_filename" "$hf_base/$model_filename" || {
+            download_file "$hf_base/$model_filename" "$MODELS_DIR/$model_filename" || {
                 red "Failed to download $model_filename"
                 exit 1
             }
@@ -355,10 +587,13 @@ cmd_pull() {
             green "mmproj already exists: $mmproj_filename"
         else
             echo "Checking for multimodal projector..."
-            if curl -sfI "$hf_base/$mmproj_filename" > /dev/null 2>&1; then
+            if curl -sfIL "$hf_base/$mmproj_filename" > /dev/null 2>&1; then
                 echo "Downloading $mmproj_filename..."
-                curl -L --progress-bar -o "$MODELS_DIR/$mmproj_filename" "$hf_base/$mmproj_filename"
-                green "Downloaded: $mmproj_filename ($(du -h "$MODELS_DIR/$mmproj_filename" | cut -f1))"
+                if download_file "$hf_base/$mmproj_filename" "$MODELS_DIR/$mmproj_filename"; then
+                    green "Downloaded: $mmproj_filename ($(du -h "$MODELS_DIR/$mmproj_filename" | cut -f1))"
+                else
+                    yellow "mmproj download failed; the model will run text-only"
+                fi
             else
                 echo "No mmproj found (text-only model)"
             fi
@@ -366,21 +601,12 @@ cmd_pull() {
 
         # save manifest
         mkdir -p "$MANIFEST_DIR"
-        local short_name="${base_name,,}"
+        local short_name
+        short_name=$(echo "$base_name" | tr '[:upper:]' '[:lower:]')
         short_name="${short_name//-/:}"
         local manifest_file="$MANIFEST_DIR/${short_name//[:\/]/_}.json"
-        python3 -c "
-import json
-info = {
-    'model_ref': '$short_name',
-    'gguf_file': '$model_filename',
-    'digest': 'hf:$hf_repo',
-    'size': $(stat --printf="%s" "$MODELS_DIR/$model_filename" 2>/dev/null || echo 0),
-    'source': 'huggingface',
-    'hf_repo': '$hf_repo'
-}
-json.dump(info, open('$manifest_file', 'w'), indent=2)
-"
+        write_manifest "$manifest_file" "$short_name" "$model_filename" "hf:$hf_repo" \
+            "$(file_size "$MODELS_DIR/$model_filename")" huggingface "hf_repo=$hf_repo"
         green "Done: $short_name"
         return
     fi
@@ -389,10 +615,20 @@ json.dump(info, open('$manifest_file', 'w'), indent=2)
     if [[ "$model_name" == http* ]]; then
         local filename
         filename=$(basename "$model_name")
+        filename="${filename%%\?*}"
+        if [[ -z "$filename" || "$filename" == .* ]]; then
+            red "Cannot derive a file name from URL: $model_name"
+            exit 1
+        fi
         green "Downloading $filename..."
-        curl -L --progress-bar -o "$MODELS_DIR/$filename" "$model_name"
+        download_file "$model_name" "$MODELS_DIR/$filename" || exit 1
         green "Done: $MODELS_DIR/$filename"
         return
+    fi
+
+    if [[ ! "$model_name" =~ ^[A-Za-z0-9._:/-]+$ || "$model_name" == *..* ]]; then
+        red "Invalid model name: $model_name"
+        exit 1
     fi
 
     # check if already pulled
@@ -404,6 +640,7 @@ json.dump(info, open('$manifest_file', 'w'), indent=2)
     fi
 
     # parse model reference
+    local library model tag
     read -r library model tag <<< "$(parse_model_ref "$model_name")"
     local ref="${model}:${tag}"
 
@@ -416,31 +653,16 @@ json.dump(info, open('$manifest_file', 'w'), indent=2)
     manifest=$(curl -sf "$manifest_url") || { red "Model not found: $ref"; exit 1; }
 
     # 2. find the model layer (GGUF blob)
-    local blob_digest blob_size
-    blob_digest=$(echo "$manifest" | python3 -c "
-import json, sys
-m = json.load(sys.stdin)
-for layer in m['layers']:
-    if layer['mediaType'] == 'application/vnd.ollama.image.model':
-        print(layer['digest'])
-        break
-")
-    blob_size=$(echo "$manifest" | python3 -c "
-import json, sys
-m = json.load(sys.stdin)
-for layer in m['layers']:
-    if layer['mediaType'] == 'application/vnd.ollama.image.model':
-        print(layer['size'])
-        break
-")
+    local blob_digest="" blob_size=""
+    read -r blob_digest blob_size < <(echo "$manifest" | manifest_model_layer) || true
 
-    if [[ -z "$blob_digest" ]]; then
+    if [[ -z "$blob_digest" || -z "$blob_size" ]]; then
         red "No model layer found in manifest"
         exit 1
     fi
 
     local size_mb=$((blob_size / 1024 / 1024))
-    local gguf_file="${model}-${tag}.gguf"
+    local gguf_file="${model//\//_}-${tag}.gguf"
 
     echo "Model: $ref"
     echo "Size: ${size_mb}MB"
@@ -448,58 +670,72 @@ for layer in m['layers']:
     echo "Saving to: $MODELS_DIR/$gguf_file"
     echo ""
 
-    # 3. download the blob
+    # 3+4. download, verify size and SHA-256, then move into place
     local blob_url="$OLLAMA_REGISTRY/v2/$library/$model/blobs/$blob_digest"
-    curl -L --progress-bar -o "$MODELS_DIR/$gguf_file" "$blob_url"
-
-    # 4. verify size
-    local actual_size
-    actual_size=$(stat --printf="%s" "$MODELS_DIR/$gguf_file" 2>/dev/null || stat -f%z "$MODELS_DIR/$gguf_file" 2>/dev/null)
-    if [[ "$actual_size" -ne "$blob_size" ]]; then
-        red "Size mismatch! Expected $blob_size, got $actual_size"
-        rm -f "$MODELS_DIR/$gguf_file"
-        exit 1
-    fi
+    download_file "$blob_url" "$MODELS_DIR/$gguf_file" "$blob_size" "${blob_digest#sha256:}" || exit 1
 
     # 5. save manifest for local tracking
     mkdir -p "$MANIFEST_DIR"
     local manifest_file="$MANIFEST_DIR/${ref//[:\/]/_}.json"
-    echo "$manifest" | python3 -c "
-import json, sys
-m = json.load(sys.stdin)
-info = {
-    'model_ref': '$ref',
-    'gguf_file': '$gguf_file',
-    'digest': '$blob_digest',
-    'size': $blob_size,
-    'layers': len(m['layers'])
-}
-json.dump(info, open('$manifest_file', 'w'), indent=2)
-"
+    write_manifest "$manifest_file" "$ref" "$gguf_file" "$blob_digest" "$blob_size" ollama-registry
 
     green "Done: $ref -> $gguf_file ($(du -h "$MODELS_DIR/$gguf_file" | cut -f1))"
 }
 
 cmd_stop() {
     local stopped=0
-    if [[ -f "$PROXY_PID_FILE" ]] && kill -0 "$(cat "$PROXY_PID_FILE")" 2>/dev/null; then
-        kill "$(cat "$PROXY_PID_FILE")" 2>/dev/null
+    local proxy_pid=""
+    local candidate=""
+    local proxy_cmd=""
+    local pid=""
+
+    # Prefer the PID file only when it identifies this project's proxy.
+    if [[ -f "$PROXY_PID_FILE" ]]; then
+        candidate=$(cat "$PROXY_PID_FILE" 2>/dev/null || true)
+        if [[ "$candidate" =~ ^[0-9]+$ ]] && kill -0 "$candidate" 2>/dev/null; then
+            proxy_cmd=$(ps -ww -p "$candidate" -o command= 2>/dev/null || true)
+            if [[ "$proxy_cmd" == *"$OLLAMA_PROXY"* ]]; then
+                proxy_pid="$candidate"
+            fi
+        fi
+    fi
+
+    # Recover if the PID file is stale, but only match this project's proxy.
+    if [[ -z "$proxy_pid" ]]; then
+        proxy_pid=$(find_project_proxy_pid) || proxy_pid=""
+    fi
+
+    if [[ -n "$proxy_pid" ]]; then
+        stop_pid "$proxy_pid" 5
         rm -f "$PROXY_PID_FILE"
         stopped=1
-    fi
-    if pid=$(get_running_pid); then
-        kill "$pid" 2>/dev/null
-        rm -f "$PID_FILE"
-        stopped=1
-    fi
-    if [[ $stopped -eq 1 ]]; then
-        green "Server stopped"
     else
-        yellow "No server running"
+        rm -f "$PROXY_PID_FILE"
+    fi
+
+    if pid=$(get_running_pid); then
+        local backend_cmd=""
+        backend_cmd=$(ps -ww -p "$pid" -o command= 2>/dev/null || true)
+        if [[ "$backend_cmd" == *"$LLAMA_SERVER"* ]]; then
+            stop_pid "$pid" 15
+            rm -f "$PID_FILE"
+            stopped=1
+        else
+            yellow "Backend PID file does not identify this project's llama-server; leaving it untouched."
+        fi
+    else
+        rm -f "$PID_FILE"
+    fi
+
+    if [[ $stopped -eq 1 ]]; then
+        green "Stopped project processes"
+    else
+        yellow "No matching project processes found"
     fi
 }
 
 cmd_ps() {
+    local pid=""
     if pid=$(get_running_pid); then
         green "Server running"
         echo "  Backend PID: $pid (port $BACKEND_PORT)"
@@ -508,7 +744,7 @@ cmd_ps() {
         fi
         echo "  Log: $LOG_FILE"
         echo -n "  Model: "
-        ps -p "$pid" -o args= 2>/dev/null | grep -oP '(?<=-m )\S+' | xargs basename 2>/dev/null || echo "unknown"
+        ps -ww -p "$pid" -o args= 2>/dev/null | sed -n 's/.* -m \([^ ]*\).*/\1/p' | xargs basename 2>/dev/null || echo "unknown"
     else
         yellow "No server running"
     fi
@@ -526,7 +762,7 @@ case "${1:-help}" in
     stop)   cmd_stop ;;
     ps)     cmd_ps ;;
     help|--help|-h)
-        echo "ollama-rdna1 - llama.cpp Vulkan wrapper (Ollama-compatible API)"
+        echo "ollama-rdna1 - llama.cpp wrapper (Ollama-compatible API)"
         echo ""
         echo "Usage: ollama-rdna1 <command> [args]"
         echo ""
@@ -538,8 +774,12 @@ case "${1:-help}" in
         echo "  stop            Stop the server"
         echo "  ps              Show server status"
         echo ""
+        echo "Environment:"
+        echo "  GPU_LAYERS=$GPU_LAYERS  CTX_SIZE=$CTX_SIZE  CACHE_PROMPT=$CACHE_PROMPT  BACKEND_WAIT=$BACKEND_WAIT"
+        echo "  OLLAMA_RDNA1_PORT=$PORT  OLLAMA_RDNA1_BACKEND_PORT=$BACKEND_PORT"
+        echo "  OLLAMA_PROXY_HOST (default 127.0.0.1; 0.0.0.0 exposes the API to the LAN)"
+        echo ""
         echo "Models are stored in: $MODELS_DIR"
-        echo "Backend: llama.cpp + Vulkan (AMD RX 5700)"
         ;;
     *)
         red "Unknown command: $1"

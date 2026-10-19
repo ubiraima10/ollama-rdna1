@@ -25,3 +25,6 @@ Thumbs.db
 .claude/
 *.swp
 *.swo
+build-*/
+*.backup-*
+*.bak-*
